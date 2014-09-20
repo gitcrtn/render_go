@@ -1,6 +1,6 @@
 // render_go - render
 // Copyright (c) 2014 Keita Yamada
-// 2014.09.20
+// 2014.09.21
 
 package main
 
@@ -8,6 +8,7 @@ import "time"
 import "math/rand"
 import "fmt"
 import "math"
+import "runtime"
 
 type Camera struct{
 	pos Vector
@@ -119,46 +120,97 @@ func Radiance(scene *Scene, setting *Setting, ray *Ray, rnd *rand.Rand, depth in
 	return inc_rad
 }
 
+type PixelCommand int
+
+const(
+	SetColor PixelCommand = iota
+	AddColor
+)
+
+type PixelOp struct{
+	command PixelCommand
+	x int
+	y int
+	color Vector
+}
+
+func Render_y(setting *Setting, camera *Camera, screen *Screen, scene *Scene, y int, image chan<- PixelOp, done chan<- bool){
+
+	rnd := rand.New(rand.NewSource(time.Now().Unix()))
+
+	for x:=0; x < setting.width; x++{
+		image <- PixelOp{SetColor,x,y,Vector{0,0,0}}
+		
+		for sy:=0; sy < setting.supersamples; sy++{
+		
+			for sx:=0; sx < setting.supersamples; sx++{
+				acm_rad := Vector{0,0,0}
+				buf_rad := Vector{0,0,0}
+				
+				for s:=0; s < setting.samples; s++{
+					ray := NewRay(camera,screen,setting,x,y,sx,sy)			
+					
+					buf_rad = Radiance(scene,setting,ray,rnd,0)
+					buf_rad.DivFloat(float64(setting.samples) * math.Pow(float64(setting.supersamples),2))						
+					acm_rad.Add(buf_rad)
+					image <- PixelOp{AddColor,x,y,acm_rad}
+				}				
+			}			
+		}
+	}
+	done <- true
+}
+
 func Render(setting *Setting, camera *Camera, screen *Screen, scene *Scene, image *ImageBuffer){
 	
 	start_time := time.Now()
 	current_time := time.Now()
 	var now_duration time.Duration
 	time_count := 1.0
-	rnd := rand.New(rand.NewSource(time.Now().Unix()))
 	
-	for y:=0; y < setting.height; y++{
-		rnd.Seed(time.Now().Unix())
-		fmt.Println(fmt.Sprintf("Rendering (y = \"%d\") %.02f%%", y, 100.0 * float64(y) / float64(setting.height - 1)))
-		
-		for x:=0; x < setting.width; x++{
-			image.SetColor(x,y,Vector{0,0,0})
-			
-			for sy:=0; sy < setting.supersamples; sy++{
-			
-				for sx:=0; sx < setting.supersamples; sx++{
-					acm_rad := Vector{0,0,0}
-					buf_rad := Vector{0,0,0}
+	y := 0
+	cpus := runtime.NumCPU()
+	runtime.GOMAXPROCS(cpus)
+	done := make(chan bool, cpus)
+	done_count := 0
+	imageChan := make(chan PixelOp, 100)
+	
+	for{
+		select{
+			case im := <- imageChan:
+				switch{
+					case im.command == SetColor:
+						image.SetColor(im.x, im.y, im.color)
 					
-					for s:=0; s < setting.samples; s++{
-						ray := NewRay(camera,screen,setting,x,y,sx,sy)			
-						
-						buf_rad = Radiance(scene,setting,ray,rnd,0)
-						buf_rad.DivFloat(float64(setting.samples) * math.Pow(float64(setting.supersamples),2))						
-						acm_rad.Add(buf_rad)
-						image.AddColor(x,y,acm_rad)
-						
-						current_time = time.Now()
-						now_duration = current_time.Sub(start_time)
-						if now_duration.Minutes() > time_count  {
-							fmt.Println(time_count, "minute(s)")
-							fmt.Println("image output...")
-							image.Out( fmt.Sprintf(setting.imagePrefix,int(time_count)) )
-							time_count += 1.0
-						}
-					}				
-				}			
-			}
-		}
-	}	
+					case im.command == AddColor:
+						image.AddColor(im.x, im.y, im.color)				
+				}
+			case <- done:
+				done_count++
+				
+			default:
+				if runtime.NumGoroutine() < cpus{
+					switch{
+						case y >= setting.height:							
+							if done_count >= setting.height{
+								return
+							}
+							
+						default:
+							fmt.Println(fmt.Sprintf("Rendering (y = \"%d\") %.02f%%", y, 100.0 * float64(y) / float64(setting.height - 1)))
+							go Render_y(setting,camera,screen,scene,y,imageChan,done)
+							y++
+					}
+				}
+				
+				current_time = time.Now()
+				now_duration = current_time.Sub(start_time)
+				if now_duration.Minutes() > time_count  {
+					fmt.Println(time_count, "minute(s)")
+					fmt.Println("image output...")
+					image.Out( fmt.Sprintf(setting.imagePrefix,int(time_count)) )
+					time_count += 1.0
+				}
+		}	
+	}
 }
